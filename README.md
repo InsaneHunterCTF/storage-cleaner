@@ -28,12 +28,12 @@ If your devices (laptop or Andriod phone) is filled up in the storage, you will 
 
 ## Installation
 
-### Ubuntu
+### ALL Operating Systems (Linux/Windows/macOS)
 ```
-git clone https://github.com/yourname/str-cl.git
+git clone https://github.com/InsaneHunterCTF/storage-cleaner.git
 ```
 ```
-cd str-cl
+cd storage-cleaner
 ```
 # Create a virtual environment and install Python deps (recommended)
 ```
