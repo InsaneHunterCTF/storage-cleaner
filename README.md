@@ -75,3 +75,15 @@ choco install adb
 ```
 python3 str-cl.py --help
 ```
+
+## Important Note:
+In phone scanning, not always the files are listed in /sdcard, so it can returns nothing for you
+try first:
+```
+adb shell find /sdcard -type f
+```
+if nothing was returned, then try:
+```
+adb shell ls /storage/emulated/0
+```
+if returned files, then in phone scanning, add the flag ``` --root /storage/emulated/0 ```
