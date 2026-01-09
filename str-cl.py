@@ -2,11 +2,8 @@
 """
 str-cl.py (storage_cleaner) — storage scanner & cleaner for local filesystem and Android devices (via adb).
 
-This version:
- - saves last phone scan to ~/.str_cl_last_scan.json
- - allows deleting specific device files by index or path
- - clean-phone accepts positional device paths (or scans if none passed)
- - delete-phone selects by index or path with safe confirmation
+This version includes robust handling for Interrupted system calls (EINTR),
+so scanning won't crash when the OS interrupts a syscall (common in macOS sandbox paths).
 """
 
 from __future__ import annotations
@@ -17,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import errno
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -26,46 +24,145 @@ from send2trash import send2trash
 
 LAST_SCAN_FILE = Path.home() / ".str_cl_last_scan.json"
 
-
+# -------------------------
 # Helpers
-
+# -------------------------
 def human(n: int) -> str:
     return format_size(n, binary=True)
 
 
+def _safe_scandir(path: Path, retries: int = 3, delay: float = 0.1):
+    """
+    Wrapper around os.scandir that retries on Interrupted system call (EINTR).
+    Returns an iterator (or raises on fatal errors).
+    """
+    attempt = 0
+    while attempt < retries:
+        try:
+            return os.scandir(path)
+        except InterruptedError:
+            attempt += 1
+            time.sleep(delay)
+            continue
+        except OSError as e:
+            # if it's EINTR (Interrupted system call) retry, otherwise raise
+            if e.errno == errno.EINTR and attempt < retries - 1:
+                attempt += 1
+                time.sleep(delay)
+                continue
+            raise
+    # final attempt (let exception propagate if it fails)
+    return os.scandir(path)
+
+
+def _safe_stat(entry, follow_symlinks=False, retries: int = 3, delay: float = 0.05):
+    """
+    Safe stat wrapper that retries a few times on EINTR.
+    """
+    attempt = 0
+    while attempt < retries:
+        try:
+            return entry.stat(follow_symlinks=follow_symlinks)
+        except InterruptedError:
+            attempt += 1
+            time.sleep(delay)
+            continue
+        except OSError as e:
+            if e.errno == errno.EINTR and attempt < retries - 1:
+                attempt += 1
+                time.sleep(delay)
+                continue
+            raise
+    # final attempt
+    return entry.stat(follow_symlinks=follow_symlinks)
+
+
 def walk_path_collect(path: Path, min_size: int, extensions: Optional[List[str]], exclude_dirs: List[str]) -> List[Tuple[int, str]]:
+    """
+    Walk path recursively and return list of (size_bytes, filepath) for files >= min_size and matching extensions (if provided).
+    Uses os.scandir for speed and robustly handles EINTR and permission issues.
+    """
     results: List[Tuple[int, str]] = []
     stack = [path]
     while stack:
         p = stack.pop()
         try:
-            with os.scandir(p) as it:
-                for entry in it:
-                    try:
-                        if entry.is_symlink():
-                            continue
-                        if entry.is_file():
-                            try:
-                                st = entry.stat(follow_symlinks=False)
+           
+            if not p.exists():
+                continue
+            if not p.is_dir():
+                # if it's a file, check directly
+                try:
+                    st = p.stat()
+                    if st.st_size >= min_size:
+                        if extensions:
+                            if any(p.name.lower().endswith(ext.lower()) for ext in extensions):
+                                results.append((st.st_size, str(p)))
+                        else:
+                            results.append((st.st_size, str(p)))
+                except (PermissionError, FileNotFoundError, OSError):
+                    continue
+                continue
+
+            
+            try:
+                with _safe_scandir(p) as it:
+                    for entry in it:
+                        try:
+                            # skip symlinks to avoid cycles
+                            if entry.is_symlink():
+                                continue
+
+                            
+                            if entry.is_file(follow_symlinks=False):
+                                try:
+                                    st = _safe_stat(entry, follow_symlinks=False)
+                                except (PermissionError, FileNotFoundError):
+                                    continue
+                                except OSError:
+                                
+                                    continue
                                 size = st.st_size
-                            except Exception:
-                                continue
-                            if size >= min_size:
-                                if extensions:
-                                    if any(entry.name.lower().endswith(ext.lower()) for ext in extensions):
+                                if size >= min_size:
+                                    if extensions:
+                                        if any(entry.name.lower().endswith(ext.lower()) for ext in extensions):
+                                            results.append((size, str(Path(p) / entry.name)))
+                                    else:
                                         results.append((size, str(Path(p) / entry.name)))
-                                else:
-                                    results.append((size, str(Path(p) / entry.name)))
-                        elif entry.is_dir():
-                            if entry.name in exclude_dirs:
+                            elif entry.is_dir(follow_symlinks=False):
+                                if entry.name in exclude_dirs:
+                                    continue
+                                # push subdir onto stack for later scanning
+                                stack.append(Path(p) / entry.name)
+                        except (PermissionError, FileNotFoundError):
+                            # skip entries we can't access
+                            continue
+                        except OSError as e:
+                            
+                            if getattr(e, "errno", None) == errno.EINTR:
                                 continue
-                            stack.append(Path(p) / entry.name)
-                    except PermissionError:
-                        continue
-        except PermissionError:
+                          
+                            continue
+            except PermissionError:
+               
+                continue
+            except FileNotFoundError:
+              
+                continue
+            except OSError as e:
+               
+                if getattr(e, "errno", None) in (errno.EINTR, errno.EAGAIN):
+                    continue
+               
+                continue
+
+        except KeyboardInterrupt:
+        
+            raise
+        except Exception:
+           
             continue
-        except FileNotFoundError:
-            continue
+
     return results
 
 
@@ -74,7 +171,7 @@ def top_n_sorted(files: List[Tuple[int, str]], n: int) -> List[Tuple[int, str]]:
 
 
 
-# Android (adb) helpers
+# Android (adb) helpers (unchanged from previous robust version)
 
 def check_adb() -> bool:
     return shutil.which("adb") is not None
@@ -161,7 +258,6 @@ def adb_list_files(root: str = "/sdcard", debug: bool = False) -> List[Tuple[int
         tried_roots.add(candidate_root)
 
         # 1) find -ls
-
         cmd = f"find {shlex.quote(candidate_root)} -type f -ls"
         if debug:
             click.echo(f"[debug] adb: {cmd}")
@@ -199,7 +295,6 @@ def adb_list_files(root: str = "/sdcard", debug: bool = False) -> List[Tuple[int
                 return parsed
 
         # 2) find -exec stat
-
         cmd = f"find {shlex.quote(candidate_root)} -type f -exec stat -c '%s %n' {{}} \\;"
         if debug:
             click.echo(f"[debug] adb: {cmd}")
@@ -222,7 +317,6 @@ def adb_list_files(root: str = "/sdcard", debug: bool = False) -> List[Tuple[int
                 return parsed
 
         # 3) ls -lR
-
         cmd = f"ls -lR {shlex.quote(candidate_root)}"
         if debug:
             click.echo(f"[debug] adb: {cmd}")
@@ -235,7 +329,6 @@ def adb_list_files(root: str = "/sdcard", debug: bool = False) -> List[Tuple[int
                 return parsed
 
         # 4) fallback iterative per-dir approach
-
         cmd = f"ls -l {shlex.quote(candidate_root)}"
         if debug:
             click.echo(f"[debug] adb: {cmd}")
@@ -298,20 +391,14 @@ def adb_list_files(root: str = "/sdcard", debug: bool = False) -> List[Tuple[int
 
 
 def adb_stat_size(path: str) -> Optional[int]:
-    # Try stat -c %s "path"
-
     rc, out, err = adb_shell(f"stat -c %s {shlex.quote(path)}", timeout=15)
     if rc == 0 and out.strip().isdigit():
         try:
             return int(out.strip())
         except Exception:
             pass
-    # Fallback to ls -l path and parse
-
     rc, out, err = adb_shell(f"ls -l {shlex.quote(path)}", timeout=10)
     if rc == 0 and out.strip():
-        # parse first file line
-
         for line in out.splitlines():
             parsed = _parse_ls_line(line.strip(), os.path.dirname(path) or "/")
             if parsed:
@@ -333,9 +420,9 @@ def adb_delete(path: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-
-# CLI tool itself (click)
-
+# -------------------------
+# CLI (click)
+# -------------------------
 @click.group()
 def cli():
     pass
@@ -349,46 +436,50 @@ def cli():
 @click.option("--top", default=20, help="Show top N largest files.")
 @click.option("--json", "to_json", default="", help="Write report to JSON file path.")
 def scan(paths, min_size, extensions, exclude_dirs, top, to_json):
-    if not paths:
-        paths = (os.path.expanduser("~"),)
-    min_size_bytes = parse_size(min_size)
-    exts = [e.strip() for e in extensions.split(",") if e.strip()]
-    excludes = [e.strip() for e in exclude_dirs.split(",") if e.strip()]
-    all_results: List[Tuple[int, str]] = []
-    click.echo(f"Scanning paths: {', '.join(paths)} (min size {human(min_size_bytes)})")
-    for p in paths:
-        pth = Path(p).expanduser()
-        if pth.is_file():
-            try:
-                sz = pth.stat().st_size
-            except Exception:
-                continue
-            if sz >= min_size_bytes:
-                if exts:
-                    if any(pth.name.lower().endswith(x.lower()) for x in exts):
+    """Scan the local filesystem paths for large files."""
+    try:
+        if not paths:
+            paths = (os.path.expanduser("~"),)
+        min_size_bytes = parse_size(min_size)
+        exts = [e.strip() for e in extensions.split(",") if e.strip()]
+        excludes = [e.strip() for e in exclude_dirs.split(",") if e.strip()]
+        all_results: List[Tuple[int, str]] = []
+        click.echo(f"Scanning paths: {', '.join(paths)} (min size {human(min_size_bytes)})")
+        for p in paths:
+            pth = Path(p).expanduser()
+            if pth.is_file():
+                try:
+                    sz = pth.stat().st_size
+                except Exception:
+                    continue
+                if sz >= min_size_bytes:
+                    if exts:
+                        if any(pth.name.lower().endswith(x.lower()) for x in exts):
+                            all_results.append((sz, str(pth)))
+                    else:
                         all_results.append((sz, str(pth)))
-                else:
-                    all_results.append((sz, str(pth)))
-        else:
-            res = walk_path_collect(pth, min_size_bytes, exts or None, excludes)
-            all_results.extend(res)
+            else:
+                res = walk_path_collect(pth, min_size_bytes, exts or None, excludes)
+                all_results.extend(res)
 
-    top_files = top_n_sorted(all_results, top)
-    if not top_files:
-        click.secho("No files found matching criteria.", fg="yellow")
+        top_files = top_n_sorted(all_results, top)
+        if not top_files:
+            click.secho("No files found matching criteria.", fg="yellow")
+            return
+
+        click.secho(f"Top {len(top_files)} files:", fg="green")
+        for size, path in top_files:
+            click.echo(f"{human(size):>10}    {path}")
+
+        if to_json:
+            report = [{"size": s, "path": p} for s, p in all_results]
+            with open(to_json, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            click.secho(f"Saved report to {to_json}", fg="blue")
+    except KeyboardInterrupt:
+        click.secho("Scan interrupted by user. Partial results (if any) are discarded.", fg="yellow")
         return
 
-    click.secho(f"Top {len(top_files)} files:", fg="green")
-    for size, path in top_files:
-        click.echo(f"{human(size):>10}    {path}")
-
-    if to_json:
-        report = [{"size": s, "path": p} for s, p in all_results]
-        with open(to_json, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
-        click.secho(f"Saved report to {to_json}", fg="blue")
-
-# Commands, I ensured that they contain everything the user would need
 
 @cli.command()
 @click.argument("paths", nargs=-1, type=str)
@@ -408,8 +499,6 @@ def clean_phone(paths, min_size, extensions, top, yes, permanent, dry_run, debug
         click.secho("adb not found on PATH. Install Android platform-tools.", fg="red")
         sys.exit(1)
 
-    # If explicit paths provided, get their sizes and treat them as candidates
-
     exts = [e.strip() for e in extensions.split(",") if e.strip()]
     candidates: List[Tuple[int, str]] = []
 
@@ -423,7 +512,6 @@ def clean_phone(paths, min_size, extensions, top, yes, permanent, dry_run, debug
                 continue
             candidates.append((size, p))
     else:
-        # no explicit paths — do a scan (use same defaults as scan_phone)
         files = adb_list_files("/storage/emulated/0", debug=debug)
         min_bytes = parse_size(min_size)
         if exts:
@@ -448,8 +536,6 @@ def clean_phone(paths, min_size, extensions, top, yes, permanent, dry_run, debug
         if ans != "DELETE":
             click.secho("Aborted by user.", fg="yellow")
             return
-
-    # perform deletion
 
     for size, path in candidates:
         ok, out = adb_delete(path)
@@ -477,7 +563,6 @@ def scan_phone(root, min_size, extensions, top, to_json, debug):
 
     click.secho("Listing files on device (this may take a while)...", fg="blue")
     files = adb_list_files(root, debug=debug)
-    # Filter
     files = [f for f in files if f[0] >= min_bytes]
     if exts:
         files = [f for f in files if any(f[1].lower().endswith(x.lower()) for x in exts)]
@@ -487,7 +572,6 @@ def scan_phone(root, min_size, extensions, top, to_json, debug):
         click.secho("No large files found on device.", fg="yellow")
         return
 
-    # Print and save last scan to ~/.str_cl_last_scan.json for later delete-by-index (path selected above)
     click.secho(f"Top {len(top_files)} files on device:", fg="green")
     scan_entries = []
     for i, (size, path) in enumerate(top_files, 1):
@@ -500,11 +584,6 @@ def scan_phone(root, min_size, extensions, top, to_json, debug):
         click.secho(f"Saved last scan to {LAST_SCAN_FILE}", fg="blue")
     except Exception:
         pass
-
-    if to_json:
-        with open(to_json, "w", encoding="utf-8") as f:
-            json.dump([{"size": s, "path": p} for s, p in files], f, indent=2)
-        click.secho(f"Saved device report to {to_json}", fg="blue")
 
 
 @cli.command(name="delete-phone")
@@ -519,10 +598,8 @@ def delete_phone(indices, paths, from_scan, yes, dry_run):
         click.secho("adb not found on PATH. Install Android platform-tools.", fg="red")
         sys.exit(1)
 
-    # Build a candidate list (size, path)
     candidates: List[Tuple[int, str]] = []
 
-    # Load last scan if requested or indices provided
     scan_entries = []
     if from_scan or indices:
         if LAST_SCAN_FILE.exists():
@@ -534,10 +611,8 @@ def delete_phone(indices, paths, from_scan, yes, dry_run):
             click.secho(f"No last scan found at {LAST_SCAN_FILE}. Run scan-phone first.", fg="yellow")
             scan_entries = []
 
-    # If indices passed as comma strings (click allows multiple), flatten them
     flat_indices: List[int] = []
     for idx in indices:
-        # allow comma-separated inside a single --index value
         for token in str(idx).split(","):
             token = token.strip()
             if not token:
@@ -547,7 +622,6 @@ def delete_phone(indices, paths, from_scan, yes, dry_run):
             except Exception:
                 pass
 
-    # Add by index
     if flat_indices and scan_entries:
         for i in flat_indices:
             entry = next((e for e in scan_entries if e.get("index") == i), None)
@@ -556,7 +630,6 @@ def delete_phone(indices, paths, from_scan, yes, dry_run):
             else:
                 click.secho(f"Index {i} not found in last scan; skipping.", fg="yellow")
 
-    # Add by paths provided explicitly
     for p in paths:
         size = adb_stat_size(p)
         if size is None:
@@ -568,7 +641,6 @@ def delete_phone(indices, paths, from_scan, yes, dry_run):
         click.secho("No files selected for deletion.", fg="yellow")
         return
 
-    # Show summary
     click.secho("Selected files for deletion (PERMANENT):", fg="red")
     for i, (sz, path) in enumerate(candidates, 1):
         click.echo(f"[{i}] {human(sz):>10}    {path}")
@@ -579,11 +651,10 @@ def delete_phone(indices, paths, from_scan, yes, dry_run):
 
     if not yes:
         ans = click.prompt("This will PERMANENTLY delete the listed files on device. Type 'DELETE' to confirm", default="", show_default=False)
-        if ans != "DELETE": # Confirmation for deletion of the selected file
+        if ans != "DELETE":
             click.secho("Aborted by user.", fg="yellow")
             return
 
-    # Delete
     for sz, path in candidates:
         ok, out = adb_delete(path)
         if ok:
